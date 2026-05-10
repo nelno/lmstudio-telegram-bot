@@ -883,10 +883,7 @@ async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context
             (base64_img, 2)    # Second frame at 2 seconds
         ]
 
-        # Notify user
-        if caption.strip():
-            await update.message.reply_text(f"📝 Caption detected: {caption[:100]}{'...' if len(caption) > 100 else ''}")
-        await update.message.reply_text("🎥 Analyzing video thumbnail as a short clip...")
+        caption.strip()
 
         # Now reuse video processing logic
         segment_descriptions = []
