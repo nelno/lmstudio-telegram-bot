@@ -1,5 +1,7 @@
 /old_scripts/**
 /venv/**
 conversations.db
+conversations.db-shm
+conversations.db-wal
 .env
 

@@ -1034,14 +1034,20 @@ async def call_opinion_stage(cid: int, update: Update, model: str) -> str:
         return f"[Error during opinion stage: {str(e)[:100]}]"
 
 async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> list:
+    """Handles both regular videos and GIF animations"""
     video_id = generate_video_id()
+    is_gif = bool(update.message.animation)
 
     try:
-        video = update.message.video
-        if not video:
+        if is_gif:
+            media = update.message.animation
+        else:
+            media = update.message.video
+
+        if not media:
             return []
 
-        # Try to process the full video first
+        # Get model
         with sqlite3.connect(DB_FILE) as conn:
             c = conn.cursor()
             c.execute("SELECT model FROM user_conversations WHERE conversation_id = ?", (cid,))
@@ -1049,33 +1055,27 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         model = row[0] if row and row[0] else DEFAULT_MODEL
 
         try:
-            file = await video.get_file()
-            frames = await extract_frames_from_video(file)
+            file = await media.get_file()
+            frames = await extract_frames_from_video(file)  # Works for both video & GIF
 
         except Exception as e:
             error_str = str(e).lower()
             if "too big" in error_str or "file is too big" in error_str:
                 await update.message.reply_text(
-                    "❌ I can see the video, but it's too large for me to download (Telegram limit is 50 MB).\n\n"
-                    "Analyzing the thumbnail instead..."
+                    "❌ File too large for full processing (Telegram 50 MB limit).\n\n"
+                    "Analyzing thumbnail instead..."
                 )
-
-                # Fallback: Use thumbnail as a photo
-                if video.thumbnail:
-                    # Reuse your existing photo handler logic
-                    user_content = await handle_photo_message_from_thumbnail(video.thumbnail, update, context, cid)
-                    # Let the normal chat flow handle the response
-                    return user_content
+                if media.thumbnail:
+                    return await handle_photo_message_from_thumbnail(media.thumbnail, update, context, cid)
                 else:
-                    await update.message.reply_text("❌ No thumbnail available either.")
+                    await update.message.reply_text("❌ No thumbnail available.")
                     return []
             else:
-                # Other error
-                await update.message.reply_text("❌ Sorry, I had trouble processing that video.")
-                logger.error(f"Video download error: {e}")
+                await update.message.reply_text("❌ Sorry, I had trouble processing that file.")
+                logger.error(f"Media download error: {e}")
                 return []
 
-        # Normal full video processing (if download succeeded)
+        # === Normal processing (frames extracted successfully) ===
         total_pairs = (len(frames) + 1) // 2
         segment_descriptions = []
 
@@ -1101,14 +1101,7 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
             opinion_response = await call_opinion_stage(cid, update, model)
 
-            logger.info("=" * 80)
-            logger.info(f"LLM OPINION RESPONSE (Segment {segment_id}/{total_pairs})")
-            logger.info("-" * 80)
-            logger.info(opinion_response)
-            logger.info("=" * 80)
-
             await update.message.reply_text(opinion_response)
-
             await asyncio.sleep(1.2)
 
         # Final Summary
@@ -1118,18 +1111,11 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
         append_message(cid, "user", final_text)
 
         final_response = await call_opinion_stage(cid, update, model)
-
-        logger.info("=" * 80)
-        logger.info("LLM FINAL VIDEO ASSESSMENT")
-        logger.info("-" * 80)
-        logger.info(final_response)
-        logger.info("=" * 80)
-
         await update.message.reply_text(final_response)
 
     except Exception as e:
-        logger.error(f"Video error: {e}")
-        await update.message.reply_text("❌ Sorry, I had trouble processing that video.")
+        logger.error(f"Video/GIF error: {e}")
+        await update.message.reply_text("❌ Sorry, I had trouble processing that GIF/video.")
 
     return []
 
@@ -1151,17 +1137,16 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_content = []
 
     try:
-        if update.message.text and not update.message.photo and not update.message.video:
+        if update.message.text and not update.message.photo and not update.message.video and not update.message.animation:
             user_content.append({"type": "text", "text": update.message.text})
 
         elif update.message.photo:
             user_content = await handle_photo_message(update, context, cid)
 
-        elif update.message.video:
+        elif update.message.video or update.message.animation:   # ← NEW
             user_content = await handle_video_message(update, context, cid)
 
     except Exception:
-        # Error already handled in the specific handler functions
         return
 
     if not user_content:
@@ -1561,7 +1546,8 @@ def main():
     app.add_handler(CommandHandler("toggle_video_mode", toggle_video_mode_command))
     app.add_handler(CommandHandler("video_status", video_status_command))
     app.add_handler(MessageHandler(filters.PHOTO, chat))
-    app.add_handler(MessageHandler(filters.VIDEO, chat))      # NEW
+    app.add_handler(MessageHandler(filters.VIDEO, chat))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION, chat))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
     print("✅ LM Studio Telegram Bot with **Vision/Image support** is running!")
