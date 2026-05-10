@@ -1132,12 +1132,18 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
     return []
 
 # ------------------------------------------------------------------------------
-# Unified Chat Handler (Text + Photo + Video) with progress messages
+# Unified Chat Handler (Text + Photo + Video + GIF) with caption support
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
 # Unified Chat Handler (Text + Photo + Video + GIF) with caption support
 # ------------------------------------------------------------------------------
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Handle both normal messages and edited messages
+    message = update.message or update.edited_message
+    if not message:
+        logger.warning("Received update with no message or edited_message")
+        return
+
     user = update.effective_user
     upsert_user(user)
 
@@ -1150,33 +1156,32 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_chat_action_safe(update, context, ChatAction.TYPING)
 
     user_content = []
-    caption = update.message.caption or ""  # Capture any text caption/description
+    # Safely get caption from either message or edited_message
+    caption = (message.caption or "") if message else ""
 
     try:
-        if update.message.text and not any([
-            update.message.photo,
-            update.message.video,
-            update.message.animation
+        if message.text and not any([
+            message.photo,
+            message.video,
+            message.animation
         ]):
-            user_content.append({"type": "text", "text": update.message.text})
+            user_content.append({"type": "text", "text": message.text})
 
-        elif update.message.photo:
+        elif message.photo:
             user_content = await handle_photo_message(update, context, cid, caption)
 
-        elif update.message.video or update.message.animation:
+        elif message.video or message.animation:
             user_content = await handle_video_message(update, context, cid, caption)
 
     except Exception as e:
         logger.error(f"Chat handler error: {e}")
-        await update.message.reply_text("❌ Something went wrong while processing your message.")
+        await message.reply_text("❌ Something went wrong while processing your message.")
         return
 
     if not user_content:
         return
 
     # Store the user message
-    # For photos and videos we store the full content (including images + caption)
-    # For pure text we store only the text string
     if isinstance(user_content, list) and len(user_content) == 1 and user_content[0].get("type") == "text":
         content_to_store = user_content[0]["text"]
     else:
@@ -1197,11 +1202,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if system_prompt.strip():
         msgs.append({"role": "system", "content": system_prompt})
 
-    # Add recent clean text history (ignores images and video_desc)
+    # Add recent clean text history
     for m in get_clean_history(cid):
         msgs.append(m)
 
-    # Add the CURRENT user message (this is where the new photo/video + caption goes)
+    # Add the CURRENT user message
     if isinstance(user_content, list):
         msgs.append({"role": "user", "content": user_content})
     else:
@@ -1211,22 +1216,21 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     debug_log_messages(msgs, label="FULL PROMPT SENT TO LLM")
 
     try:
-        # Run the blocking LLM call in a thread with timeout
         data = await asyncio.wait_for(
             asyncio.to_thread(call_lm_studio_chat, msgs, model),
             timeout=LLM_MSG_TIMEOUT
         )
     except asyncio.TimeoutError:
         logger.error("LLM response timed out")
-        await update.message.reply_text("❌ The model didn't respond in time. Please try again.")
+        await message.reply_text("❌ The model didn't respond in time. Please try again.")
         return
     except Exception as e:
         logger.error(f"LLM call error: {e}")
-        await update.message.reply_text("❌ Sorry, I had trouble getting a response from the model.")
+        await message.reply_text("❌ Sorry, I had trouble getting a response from the model.")
         return
 
     if "error" in data:
-        await update.message.reply_text(f"API Error: {data['error']}")
+        await message.reply_text(f"API Error: {data['error']}")
         return
 
     try:
@@ -1236,7 +1240,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     append_message(cid, "assistant", assistant_text)
 
-    await update.message.reply_text(assistant_text, parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text(assistant_text, parse_mode=ParseMode.MARKDOWN)
 
 # ------------------------------------------------------------------------------
 # Command Handlers
