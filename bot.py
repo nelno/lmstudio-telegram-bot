@@ -791,12 +791,11 @@ async def call_opinion_stage_for_image(cid: int, update: Update, model: str) -> 
         logger.error(f"Image opinion stage error: {e}")
         return f"[Error during image opinion: {str(e)[:100]}]"
     
-async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> list:
-    """Process photo (or thumbnail) with two-stage vision → opinion flow"""
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int, caption: str = "") -> list:
+    """Process photo with optional caption"""
     try:
         photo = update.message.photo[-1] if update.message.photo else None
         if not photo and update.message.video and update.message.video.thumbnail:
-            # Fallback for video thumbnail (already handled in video handler)
             photo = update.message.video.thumbnail
 
         if not photo:
@@ -804,45 +803,39 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
         base64_img = await download_photo_to_base64(photo)
 
-        # Build content for storage + first stage
+        # Build content with caption if present
         image_content = [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}},
-            *build_image_description_prompt()   # adds the instruction text
         ]
 
-        # Store the full user message with image + instruction
+        if caption.strip():
+            image_content.append({"type": "text", "text": f"Caption: {caption}"})
+
+        image_content.extend(build_image_description_prompt())
+
         append_message(cid, "user", image_content)
 
-        # === STAGE 1: Get raw description ===
         await send_chat_action_safe(update, context, ChatAction.TYPING)
 
-        model = get_user_settings(update.effective_user.id)["default_model"]  # or fetch from conversation
+        model = get_user_settings(update.effective_user.id)["default_model"]
 
-        desc_response = await call_vision_stage_for_image(cid, update, model)  # we'll define this below
-
+        desc_response = await call_vision_stage_for_image(cid, update, model)
         raw_desc = extract_image_description(desc_response) or desc_response[:800]
 
-        # Store the description internally (not shown to user)
         append_message(cid, "image_desc", f"Image description: {raw_desc}")
 
-        # === STAGE 2: Get opinion ===
+        # === STAGE 2: Opinion (caption is already in history) ===
         await send_chat_action_safe(update, context, ChatAction.TYPING)
 
         opinion_prompt = build_image_opinion_prompt(raw_desc)
+        if caption.strip():
+            opinion_prompt = f"Caption: {caption}\n\n{opinion_prompt}"
+
         append_message(cid, "user", opinion_prompt)
 
         opinion_response = await call_opinion_stage_for_image(cid, update, model)
 
-        logger.info("=" * 80)
-        logger.info("LLM IMAGE OPINION RESPONSE")
-        logger.info("-" * 80)
-        logger.info(opinion_response)
-        logger.info("=" * 80)
-
-        # Show ONLY the opinion to the user
         await update.message.reply_text(opinion_response)
-
-        # Return empty so the main chat() handler doesn't send another response
         return []
 
     except Exception as e:
@@ -850,11 +843,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Sorry, I had trouble analyzing that image.")
         return []
 
-async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> list:
-    """Treat video thumbnail as a tiny 2-frame video.
-       Uses the same thumbnail as both first and last frame with fake timestamps.
-       This allows the bot to process it through the video pipeline for better context.
-    """
+async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int, caption: str = "") -> list:
+    """Treat video thumbnail as a tiny 2-frame video with optional caption support."""
     saved_path = None
     try:
         if not thumbnail:
@@ -867,7 +857,7 @@ async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context
             filename = f"thumbnail_{timestamp}.jpg"
             saved_path = os.path.join(os.getcwd(), filename)
 
-            base64_img = await download_photo_to_base64(thumbnail)  # we'll reuse this below
+            base64_img = await download_photo_to_base64(thumbnail)
             img_data = base64.b64decode(base64_img)
             with open(saved_path, "wb") as f:
                 f.write(img_data)
@@ -884,7 +874,7 @@ async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context
         model = row[0] if row and row[0] else DEFAULT_MODEL
 
         # === Pretend this is a 2-frame video ===
-        video_id = generate_video_id()   # reuse your existing function
+        video_id = generate_video_id()
 
         # Use the SAME thumbnail as both frames with fake timestamps
         base64_img = await download_photo_to_base64(thumbnail)
@@ -893,10 +883,12 @@ async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context
             (base64_img, 2)    # Second frame at 2 seconds
         ]
 
-        # Notify user we're treating it as a short video
+        # Notify user
+        if caption.strip():
+            await update.message.reply_text(f"📝 Caption detected: {caption[:100]}{'...' if len(caption) > 100 else ''}")
         await update.message.reply_text("🎥 Analyzing video thumbnail as a short clip...")
 
-        # Now reuse your existing video processing logic (segment by segment)
+        # Now reuse video processing logic
         segment_descriptions = []
 
         # Process the single "segment" (pair of frames)
@@ -907,6 +899,9 @@ async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context
 
         # 1. Vision Stage - Get description of the "video"
         vision_content = build_vision_prompt(pair, video_id, segment_id, segment_descriptions)
+        if caption.strip():
+            vision_content.insert(1, {"type": "text", "text": f"User caption: {caption}"})
+
         append_message(cid, "user", vision_content)
 
         vision_response = await call_vision_stage(cid, update, model)
@@ -917,6 +912,9 @@ async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context
 
         # 2. Opinion Stage for this segment
         opinion_text = build_opinion_prompt(video_id, segment_descriptions, desc)
+        if caption.strip():
+            opinion_text = f"Caption: {caption}\n\n{opinion_text}"
+
         append_message(cid, "user", opinion_text)
 
         opinion_response = await call_opinion_stage(cid, update, model)
@@ -933,6 +931,9 @@ async def handle_photo_message_from_thumbnail(thumbnail, update: Update, context
         await send_chat_action_safe(update, context, ChatAction.TYPING)
 
         final_text = build_final_summary_prompt(video_id, segment_descriptions)
+        if caption.strip():
+            final_text = f"Caption: {caption}\n\n{final_text}"
+
         append_message(cid, "user", final_text)
 
         final_response = await call_opinion_stage(cid, update, model)
@@ -1033,19 +1034,23 @@ async def call_opinion_stage(cid: int, update: Update, model: str) -> str:
         logger.error(f"Opinion stage error: {e}")
         return f"[Error during opinion stage: {str(e)[:100]}]"
 
-async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int) -> list:
-    """Handles both regular videos and GIF animations"""
+async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYPE, cid: int, caption: str = "") -> list:
+    """Handles both regular videos and GIF animations with optional caption"""
     video_id = generate_video_id()
     is_gif = bool(update.message.animation)
 
     try:
         if is_gif:
             media = update.message.animation
+            media_type = "GIF"
         else:
             media = update.message.video
+            media_type = "video"
 
         if not media:
             return []
+
+        caption.strip()
 
         # Get model
         with sqlite3.connect(DB_FILE) as conn:
@@ -1056,26 +1061,27 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
         try:
             file = await media.get_file()
-            frames = await extract_frames_from_video(file)  # Works for both video & GIF
+            frames = await extract_frames_from_video(file)
 
         except Exception as e:
+            # ... (existing too-big / thumbnail fallback logic stays the same) ...
             error_str = str(e).lower()
             if "too big" in error_str or "file is too big" in error_str:
                 await update.message.reply_text(
-                    "❌ File too large for full processing (Telegram 50 MB limit).\n\n"
-                    "Analyzing thumbnail instead..."
+                    "❌ File too large for full processing.\nAnalyzing thumbnail instead..."
                 )
                 if media.thumbnail:
-                    return await handle_photo_message_from_thumbnail(media.thumbnail, update, context, cid)
+                    return await handle_photo_message_from_thumbnail(
+                        media.thumbnail, update, context, cid, caption
+                    )
                 else:
                     await update.message.reply_text("❌ No thumbnail available.")
                     return []
             else:
                 await update.message.reply_text("❌ Sorry, I had trouble processing that file.")
-                logger.error(f"Media download error: {e}")
                 return []
 
-        # === Normal processing (frames extracted successfully) ===
+        # === Normal processing ===
         total_pairs = (len(frames) + 1) // 2
         segment_descriptions = []
 
@@ -1085,8 +1091,12 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
             await send_chat_action_safe(update, context, ChatAction.TYPING)
 
-            # 1. Vision Stage
+            # Vision prompt with caption
             vision_content = build_vision_prompt(pair, video_id, segment_id, segment_descriptions)
+            if caption.strip():
+                # Insert caption at the beginning
+                vision_content.insert(1, {"type": "text", "text": f"User caption: {caption}"})
+
             append_message(cid, "user", vision_content)
 
             vision_response = await call_vision_stage(cid, update, model)
@@ -1095,19 +1105,24 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
             store_segment_description(cid, video_id, segment_id, desc)
             segment_descriptions.append(desc)
 
-            # 2. Opinion Stage
+            # Opinion stage with caption context
             opinion_text = build_opinion_prompt(video_id, segment_descriptions, desc)
+            if caption.strip():
+                opinion_text = f"Caption: {caption}\n\n{opinion_text}"
+
             append_message(cid, "user", opinion_text)
 
             opinion_response = await call_opinion_stage(cid, update, model)
-
             await update.message.reply_text(opinion_response)
             await asyncio.sleep(1.2)
 
-        # Final Summary
+        # Final summary
         await send_chat_action_safe(update, context, ChatAction.TYPING)
 
         final_text = build_final_summary_prompt(video_id, segment_descriptions)
+        if caption.strip():
+            final_text = f"Caption: {caption}\n\n{final_text}"
+
         append_message(cid, "user", final_text)
 
         final_response = await call_opinion_stage(cid, update, model)
@@ -1115,12 +1130,15 @@ async def handle_video_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     except Exception as e:
         logger.error(f"Video/GIF error: {e}")
-        await update.message.reply_text("❌ Sorry, I had trouble processing that GIF/video.")
+        await update.message.reply_text(f"❌ Sorry, I had trouble processing that {media_type}.")
 
     return []
 
 # ------------------------------------------------------------------------------
 # Unified Chat Handler (Text + Photo + Video) with progress messages
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Unified Chat Handler (Text + Photo + Video + GIF) with caption support
 # ------------------------------------------------------------------------------
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1135,25 +1153,32 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_chat_action_safe(update, context, ChatAction.TYPING)
 
     user_content = []
+    caption = update.message.caption or ""  # Capture any text caption/description
 
     try:
-        if update.message.text and not update.message.photo and not update.message.video and not update.message.animation:
+        if update.message.text and not any([
+            update.message.photo,
+            update.message.video,
+            update.message.animation
+        ]):
             user_content.append({"type": "text", "text": update.message.text})
 
         elif update.message.photo:
-            user_content = await handle_photo_message(update, context, cid)
+            user_content = await handle_photo_message(update, context, cid, caption)
 
-        elif update.message.video or update.message.animation:   # ← NEW
-            user_content = await handle_video_message(update, context, cid)
+        elif update.message.video or update.message.animation:
+            user_content = await handle_video_message(update, context, cid, caption)
 
-    except Exception:
+    except Exception as e:
+        logger.error(f"Chat handler error: {e}")
+        await update.message.reply_text("❌ Something went wrong while processing your message.")
         return
 
     if not user_content:
         return
 
     # Store the user message
-    # For photos and videos we store the full content (including images)
+    # For photos and videos we store the full content (including images + caption)
     # For pure text we store only the text string
     if isinstance(user_content, list) and len(user_content) == 1 and user_content[0].get("type") == "text":
         content_to_store = user_content[0]["text"]
@@ -1179,7 +1204,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for m in get_clean_history(cid):
         msgs.append(m)
 
-    # Add the CURRENT user message (this is where the new photo/video goes)
+    # Add the CURRENT user message (this is where the new photo/video + caption goes)
     if isinstance(user_content, list):
         msgs.append({"role": "user", "content": user_content})
     else:
